@@ -1,8 +1,9 @@
 import os, re, json, requests
 import sys, time as _time
-from datetime import datetime
+from datetime import datetime, timezone
 
 MAX_ARTICLES = 1000
+MEDIUM_USER = ""  # must be set via --user
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -24,14 +25,17 @@ def parse_list_url(url):
         return m.group(1), m.group(2)
     return None, None
 
+def slugify_name(name):
+    return name.strip().lower().replace(" ", "-").replace("/", "-")
+
 def fetch_list(session, list_url, medium_user=""):
     slug, list_id = parse_list_url(list_url)
     if not list_id:
         print("Invalid list URL")
         return []
-
+    
     print(f"Fetching list: {slug} ({list_id})")
-
+    
     LIST_GQL = """
     query CatalogItems($catalogId: ID!, $pagingOptions: CatalogPagingOptionsInput!) {
         catalogById(catalogId: $catalogId) {
@@ -44,11 +48,11 @@ def fetch_list(session, list_url, medium_user=""):
         }
     }
     """
-
+    
     all_articles = {}
     seen_post_ids = set()
     page = 0
-
+    
     while True:
         paging = {"cursor": None if page == 0 else {"id": f"offset:{page * 20}"}, "limit": 20}
         gql = {
@@ -56,27 +60,27 @@ def fetch_list(session, list_url, medium_user=""):
             "variables": {"catalogId": list_id, "pagingOptions": paging},
             "query": LIST_GQL,
         }
-
+        
         try:
             r = session.post("https://medium.com/_/graphql", json=gql, timeout=15)
         except:
             break
-
+        
         if r.status_code != 200:
             print(f"  Page {page}: HTTP {r.status_code}")
             break
-
+        
         result = r.json()
         if "errors" in result:
             print(f"  Page {page}: {result['errors'][0]['message'][:100]}")
             break
-
+        
         conn = result.get("data", {}).get("catalogById", {}).get("itemsConnection", {})
         items = conn.get("items", [])
         paging_result = conn.get("paging", {})
         total = paging_result.get("count", 0)
         next_cursor = paging_result.get("nextPageCursor", {})
-
+        
         new_count = 0
         for item in items:
             entity = item.get("entity") or {}
@@ -88,21 +92,22 @@ def fetch_list(session, list_url, medium_user=""):
                 all_articles[link] = {
                     "title": entity.get("title", ""),
                     "link": link,
+                    "published": "",
                     "tags": [],
                 }
                 new_count += 1
-
+        
         print(f"  Page {page}: {len(items)} items, {new_count} new (total: {len(all_articles)}/{total})")
-
+        
         if not next_cursor or not next_cursor.get("id"):
             break
-
+        
         page += 1
         _time.sleep(0.3)
-
+        
         if page > 20:
             break
-
+    
     return list(all_articles.values())
 
 def fetch_articles(session, list_url, medium_user=""):
@@ -110,11 +115,11 @@ def fetch_articles(session, list_url, medium_user=""):
     sorted_articles = sorted(articles, key=lambda a: a.get("title", ""))
     return sorted_articles[:MAX_ARTICLES]
 
-def save_md(articles, list_name="", medium_user="", output=None):
+def save_md(articles, list_name="", medium_user=""):
     title = f"Stories by @{medium_user}"
     if list_name:
         title += f" - List: {list_name}"
-
+    
     lines = [
         f"# {title}",
         f"",
@@ -127,7 +132,9 @@ def save_md(articles, list_name="", medium_user="", output=None):
         lines.append(f"## {i}. {a['title']}")
         lines.append(f"")
         lines.append(f"{a['link']}")
-
+        if a.get("tags"):
+            lines.append(f"Tags: {', '.join(a['tags'])}")
+    
     output = "\n".join(lines) + "\n"
     filename = os.path.join(app_dir(), "medium_articles.md")
     with open(filename, "w", encoding="utf-8") as f:
@@ -185,7 +192,7 @@ def discover_all_lists(session, medium_user=""):
             break
         if len(catalogs) >= 200:
             break
-
+    
     return catalogs
 
 def resolve_list_url(session, arg, medium_user=""):
@@ -211,32 +218,41 @@ def resolve_list_url(session, arg, medium_user=""):
     sys.exit(1)
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Fetch articles from a Medium reading list")
-    parser.add_argument('--user', required=True, help='Medium username (from URL: medium.com/@USERNAME)')
-    parser.add_argument('--list', nargs='*', default=[], help='List name(s) or URL(s). If omitted, shows available lists.')
-    args = parser.parse_args()
-
     session = make_session()
-    user = args.user
-
-    if not args.list:
-        all_lists = discover_all_lists(session, medium_user=user)
-        print(f"Avaliable lists for @{user}:")
-        for name in sorted(all_lists.keys()):
-            print(f"  {name}")
-        sys.exit(0)
-
-    for list_arg in args.list:
-        list_url, list_name = resolve_list_url(session, list_arg, medium_user=user)
-        print(f"\nUser: @{user}")
-        print(f"Fetching list: {list_name}")
-
-        articles = fetch_articles(session, list_url=list_url, medium_user=user)
-        print(f"\n{'='*40}")
-        print(f"Total: {len(articles)} articles")
-        for i, a in enumerate(articles, 1):
-            print(f"{i:>3}. {a['title'][:70]}")
-
-        saved = save_md(articles, list_name=list_name, medium_user=user)
-        print(f"Saved: {os.path.abspath(saved)}")
+    
+    name = None
+    user = MEDIUM_USER
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--list" and i + 1 < len(sys.argv):
+            name = sys.argv[i + 1]
+            i += 2
+        elif arg == "--user" and i + 1 < len(sys.argv):
+            user = sys.argv[i + 1]
+            i += 2
+        elif arg.startswith("-"):
+            i += 1
+        else:
+            parts = []
+            while i < len(sys.argv) and not sys.argv[i].startswith("-"):
+                parts.append(sys.argv[i])
+                i += 1
+            name = " ".join(parts)
+    
+    if not user:
+        print("Usage: py medium_feed.py --user YOUR_USERNAME listname")
+        print("Find your username from your article URL: https://medium.com/@YOUR_USERNAME/article-title")
+        sys.exit(1)
+    list_url, list_name = resolve_list_url(session, name, medium_user=user)
+    print(f"User: @{user}")
+    print(f"Fetching list: {list_name}")
+    
+    articles = fetch_articles(session, list_url=list_url, medium_user=user)
+    print(f"\n{'='*40}")
+    print(f"Total: {len(articles)} articles")
+    for i, a in enumerate(articles, 1):
+        print(f"{i:>3}. {a['title'][:70].encode('ascii', 'replace').decode('ascii')}")
+    
+    saved = save_md(articles, list_name=list_name, medium_user=user)
+    print(f"\nSaved: {os.path.abspath(saved)}")
